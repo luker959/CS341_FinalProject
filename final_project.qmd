@@ -1,0 +1,630 @@
+---
+title: "CS341 Final Project"
+author: "Luke Huff, Annabel Goldman, Ellie Goldsmith, Kendall Smart, Calista Smith"
+date: today
+format: 
+  pdf:
+      toc: true
+      toc-depth: 4
+      shift-heading-level-by: 2
+      fig-pos: "H"
+      fig-cap-location: top
+      geometry:
+        - top=1in
+        - right=.8in
+        - bottom=1in
+        - left=.8in
+      link-citations: true
+      linkcolor: blue
+      include-in-header: 
+        text: |
+          \usepackage{fancyhdr}
+          \usepackage{titling}
+          \pagestyle{fancy}
+          \fancyhf{}
+          \renewcommand\maketitle{
+            \fancyhead[C]{
+              \thetitle
+              \ifx \theauthor\empty  \else \ – \theauthor \fi
+              \ifx \thedate\empty  \else \ – \thedate \ \fi
+            }
+          }
+          \fancyfoot[C]{\thepage}
+---
+
+## Initialization of data sets and networks
+The datasets we decided to use are split up depending on whether the hyperlink was present in the title or in the body of the text of the post. Additionally, each entry in the dataset contains almost 50 properties, of which we will only use 3. We will clean the data and combine it into a single dataset with the columns we want. We will then convert it to a network whose nodes are the unique set of subreddits present in the SOURCE_SUBREDDIT and TARGET_SUBREDDIT columns and whose edges are the ties between the subreddit (hyperlink present in the source subreddit pointing to the target subreddit).
+
+```{r}
+
+#| echo: false
+#| output: false
+#| message: false
+#| label: imports
+
+######################################################################################
+# Clear your global environment
+######################################################################################
+rm(list=ls())
+
+######################################################################################
+# Set current directory
+######################################################################################
+setwd("/Users/lukehuff/Repos/CS341_FinalProject")
+
+######################################################################################
+# Import and Load Libraries
+######################################################################################
+list.of.packages <- c("dplyr", "tidytext", "tidygraph", "ggraph", "tidyverse", "topicmodels", "textstem", "udpipe", "tinytex", "RSiena", "Matrix", "openxlsx", "readr", "network")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+library(dplyr)
+library(readr)
+library(tidytext)
+library(tidygraph)
+library(ggraph)
+library(igraph)
+library(tidyverse)
+library(topicmodels)
+library(textstem)
+library(udpipe)
+library(dplyr)
+library(igraph)
+library(RSiena)
+library(Matrix)
+library(openxlsx)
+library(arrow)
+library(readr)
+library(network)
+library(visNetwork)
+```
+
+```{r}
+
+#| label: load dataset
+
+######################################################################################
+# Load Data Sets
+######################################################################################
+
+output_file <- "combined_redditHyperlinks.tsv"
+
+if(!file.exists(output_file)) {
+  
+  # Read the datasets
+  title_data <- read_tsv('soc-redditHyperlinks-title.tsv')
+  body_data <- read_tsv('soc-redditHyperlinks-body.tsv')
+  
+  # Function. to extract pertinent columns
+  extract_properties <- function(df, from) {
+    
+    # Split the properties column and convert to dataframe
+    properties_df <- as.data.frame(do.call(rbind, strsplit(df$PROPERTIES, ",")))
+    colnames(properties_df) <- paste0("Prop", 1:ncol(properties_df))
+    
+    # Select and rename the properties columns we want
+    properties_df <- properties_df %>%
+      transmute(
+        PositiveSentiment = as.numeric(Prop19),
+        NegativeSentiment = as.numeric(Prop20),
+        CompoundSentiment = as.numeric(Prop21)
+      )
+    
+    # Add extracted properties to original dataframe
+    df <- bind_cols(df, properties_df)
+    
+    # Add column to distinguish between body and title data in new dataset
+    df <- mutate(df, BODY_OR_TITLE = from)
+    
+    # Select the columns we want
+    df %>%
+      select(SOURCE_SUBREDDIT, TARGET_SUBREDDIT, POST_ID, TIMESTAMP, LINK_SENTIMENT, 
+             PositiveSentiment, NegativeSentiment, CompoundSentiment, BODY_OR_TITLE)
+  }
+  
+  #Apply the function to both datasets
+  title_processed <- extract_properties(title_data, FALSE)
+  body_processed <- extract_properties(body_data, TRUE)
+  
+  #Combine the datasets
+  combined_data <- bind_rows(title_processed, body_processed)
+  
+  #Write the data to a new file
+  write_tsv(combined_data, output_file)
+} else {
+  combined_data <- read_tsv(output_file)
+}
+
+```
+
+```{r}
+
+#| label: create network
+
+######################################################################################
+# Create the Network
+######################################################################################
+
+if(!file.exists('reddit_network.rds')) {
+  # Create a directed graph from the dataset
+  reddit_network <- graph_from_data_frame(
+    d = combined_data,
+    directed = TRUE,
+    vertices = data.frame(name = unique(c(combined_data$SOURCE_SUBREDDIT, combined_data$TARGET_SUBREDDIT)))
+  )
+  
+  # Assign attributes to the edges
+  E(reddit_network)$POST_ID <- combined_data$POST_ID
+  E(reddit_network)$TIMESTAMP <- combined_data$TIMESTAMP
+  E(reddit_network)$LINK_SENTIMENT <- combined_data$LINK_SENTIMENT
+  E(reddit_network)$PositiveSentiment <- combined_data$PositiveSentiment
+  E(reddit_network)$NegativeSentiment <- combined_data$NegativeSentiment
+  E(reddit_network)$CompoundSentiment <- combined_data$CompoundSentiment
+  E(reddit_network)$BODY_OR_TITLE <- combined_data$BODY_OR_TITLE
+
+  saveRDS(reddit_network, file="reddit_network.rds")
+  
+} else {
+  
+  reddit_network <- readRDS('reddit_network.rds')
+  
+}
+
+print(summary(reddit_network))
+
+
+```
+
+```{r}
+######################################################################################
+# Visualize the Network
+######################################################################################
+subset <- V(reddit_network)[degree(reddit_network) > 500]
+reddit_subgraph <- induced_subgraph(reddit_network, subset)
+reddit_subgraph %>%
+  plot(
+    .,
+    layout = layout_with_gem(.),
+    edge.arrow.size = .3,
+    vertex.size = 4,
+    vertex.label = NA,
+    vertex.color = adjustcolor(graph.coreness(.), alpha.f = .3),
+    vertex.label.cex = .5,
+    vertex.label.color = 'black',
+    mark.groups = by(seq_along(graph.coreness(.)), graph.coreness(.), invisible),
+    mark.shape = 1 / 4,
+    mark.col = rainbow(length(unique(graph.coreness(
+      .
+    ))), alpha = .1),
+    mark.border = NA
+  )
+```
+
+```{r}
+
+#| label: component analysis
+
+######################################################################################
+# Component Analysis
+######################################################################################
+
+# size of the network
+vcount(reddit_network) # number of nodes
+ecount(reddit_network) # number of edges
+
+#density of the network
+graph.density(reddit_network)
+
+# number of components in the network
+cmpnts <- components(reddit_network)
+
+cmpnts$csize
+cmpnts$no
+
+
+```
+
+## Component Analysis
+As we can see the network is composed of 67,180 subreddits with 858,488 directed ties between them. Despite the large number of edges the network still only has a density of 0.000190222. In this network, there are a total of 712 components. There is one dominant component containing 97.7% of the subreddits. The rest of the components are composed of anywhere between 2 and 9 (most likely smaller) subreddits.
+
+```{r}
+
+#| label: betweenness centrality analysis
+
+######################################################################################
+# Betweenness Centrality Analysis
+######################################################################################
+betweenness_scores <- betweenness(reddit_network,  directed = TRUE)
+
+subreddit_betweenness <- data.frame(
+  subreddit = V(reddit_network)$name,
+  betweenness = betweenness_scores
+)
+
+top_subreddits_by_betweenness <- subreddit_betweenness %>%
+  arrange(desc(betweenness))
+
+head(top_subreddits_by_betweenness, n = 10)
+
+```
+
+## Betweenness Centrality Analysis
+As we might expect, the subreddits with the highest betweenness centrality scores were subreddits that primarily source and compile content from others subreddits.
+
+```{r}
+
+#| label: create model data
+
+######################################################################################
+# Analysis of the Effect of connections with positive sentiment on future volume
+# of connections
+######################################################################################
+
+# standardize timestamp format
+combined_data$TIMESTAMP <- as.POSIXct(combined_data$TIMESTAMP, format = "%Y-%m-%d %H:%M:%S")
+
+#drop columns we don't need
+combined_data <- combined_data %>%
+  select(-PositiveSentiment, -NegativeSentiment, -BODY_OR_TITLE, -POST_ID)
+
+# aggregate data by unique pairs of subreddits within each year we have data for
+# create a column, link_count that represents the number of ties with positive
+# sentiment from the source subreddit to the target subreddit within a 
+# given year
+yearly_links <- combined_data %>%
+  group_by(SOURCE_SUBREDDIT, TARGET_SUBREDDIT, year = floor_date(TIMESTAMP, "year")) %>%
+  summarise(
+    link_count = sum(LINK_SENTIMENT == 1, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# aggregate the data by unique subreddits with outgoing ties within each year
+#we have data for - create a column avg_sentiment that is the average 
+# compound sentiment for their outgoing ties for that year
+yearly_sentiments <- combined_data %>%
+  group_by(SOURCE_SUBREDDIT, year = floor_date(TIMESTAMP, "year")) %>%
+  summarise(
+    avg_sentiment = mean(CompoundSentiment, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# create a mapping from names of subreddits to ids that we will use to 
+# identify them
+all_subreddits <- unique(c(yearly_links$SOURCE_SUBREDDIT, yearly_links$TARGET_SUBREDDIT))
+subreddit_ids <- setNames(seq_along(all_subreddits), all_subreddits)
+subreddit_mapping <- data.frame(subreddit = names(subreddit_ids), id = subreddit_ids, stringsAsFactors = FALSE)
+
+# apply the mapping to the links aggregate
+yearly_links <- yearly_links %>%
+  left_join(subreddit_mapping, by = c("SOURCE_SUBREDDIT" = "subreddit")) %>%
+  mutate(SOURCE_SUBREDDIT = id) %>%
+  select(-id) %>%
+  left_join(subreddit_mapping, by = c("TARGET_SUBREDDIT" = "subreddit")) %>%
+  mutate(TARGET_SUBREDDIT = id) %>%
+  select(-id)
+
+# apply the mapping to the sentiment aggregate
+yearly_sentiments <- yearly_sentiments %>%
+  left_join(subreddit_mapping, by = c("SOURCE_SUBREDDIT" = "subreddit")) %>%
+  mutate(SOURCE_SUBREDDIT = id) %>%
+  select(-id)
+
+# split the links aggregate and sentiment aggregate into lists of 
+# dataframes separated by year
+yearly_links_split <- split(yearly_links, yearly_links$year)
+yearly_sentiments_split <- split(yearly_sentiments, yearly_sentiments$year)
+
+# drop the year 2013 because there's not much data
+yearly_links_split <- yearly_links_split[!names(yearly_links_split) %in% "2013-01-01"]
+yearly_sentiments_split <- yearly_sentiments_split[!names(yearly_sentiments_split) %in% "2013-01-01"]
+
+# write the links aggregate to an excel file for additional processing
+write.xlsx(yearly_links_split, 'yearly_links_split.xlsx')
+```
+
+## Outside Data Processing
+We did some data processing with the following python script. In order to reduce the size of the network and to reduce it to nodes that are present throughout the entire time frame, we remove ties between subreddits that are not present in each of the years we're analyzing.
+``` python
+import pandas as pd
+def load_excel_to_dataframe(file_path):
+    try:
+        xls = pd.ExcelFile(file_path)
+        yearly_links_split = [xls.parse(sheet_name) for sheet_name in xls.sheet_names]
+        return yearly_links_split
+    except Exception as e:
+        print(f"An error occurred while loading the file: {e}")
+        return None
+
+file_path = 'yearly_links_split.xlsx'
+yearly_links_split = load_excel_to_dataframe(file_path)
+unique_pairs_list = [df.drop_duplicates(subset=['SOURCE_SUBREDDIT', 'TARGET_SUBREDDIT']) for df in yearly_links_split]
+pairs_as_tuples = [set(zip(df['SOURCE_SUBREDDIT'], df['TARGET_SUBREDDIT'])) for df in unique_pairs_list]
+common_pairs = set.intersection(*pairs_as_tuples)
+filtered_yearly_links_split = [
+    df[df.apply(lambda row: (row['SOURCE_SUBREDDIT'], row['TARGET_SUBREDDIT']) in common_pairs, axis=1)]
+    for df in yearly_links_split
+]
+for i, df in enumerate(filtered_yearly_links_split):
+    df.to_csv(f'yearly_links_{i}.csv', index=False)
+```
+
+
+```{r}
+
+# upload links by year from local file
+yearly_links_list <- lapply(0:(length(yearly_links_split) - 1), function(i) {
+  read.csv(sprintf("yearly_links_%d.csv", i))
+})
+
+# get unique subreddit ids from links
+all_subreddit_ids_list <- lapply(yearly_links_list, function(df) {
+  unique(c(df$SOURCE_SUBREDDIT, df$TARGET_SUBREDDIT))
+})
+
+# remove sentiment entries that don't exist in the links
+yearly_sentiments_split <- mapply(function(sentiments, ids) {
+  sentiments %>%
+    dplyr::filter(SOURCE_SUBREDDIT %in% ids)
+}, yearly_sentiments_split, all_subreddit_ids_list, SIMPLIFY = FALSE)
+
+# get unique ids from sentiments
+unique_ids_sentiments <- unique(unlist(lapply(yearly_sentiments_split, function(df) {
+  df$SOURCE_SUBREDDIT
+})))
+
+# get unique ids from links
+unique_ids_links <- unique(unlist(lapply(yearly_links_list, function(df) {
+  c(df$SOURCE_SUBREDDIT, df$TARGET_SUBREDDIT)
+})))
+
+# aggregate unique ids
+all_unique_ids <- unique(c(unique_ids_sentiments, unique_ids_links))
+
+# create a mapping from the old ids to new ones based
+# on the nodes we decided to include
+id_mapping_df <- data.frame(
+  old_id = all_unique_ids,
+  new_id = seq_along(all_unique_ids)
+)
+
+# map the new ids into the sentiment data
+yearly_sentiments_split <- lapply(yearly_sentiments_split, function(df) {
+  df <- df %>% 
+    left_join(id_mapping_df, by = c("SOURCE_SUBREDDIT" = "old_id")) %>%
+    mutate(SOURCE_SUBREDDIT = new_id) %>%
+    select(-new_id)
+  df
+})
+
+# map the new ids into the link data
+yearly_links_list <- lapply(yearly_links_list, function(df) {
+  df <- df %>% 
+    left_join(id_mapping_df, by = c("SOURCE_SUBREDDIT" = "old_id")) %>%
+    mutate(SOURCE_SUBREDDIT = new_id) %>%
+    select(-new_id) %>%
+    left_join(id_mapping_df, by = c("TARGET_SUBREDDIT" = "old_id")) %>%
+    mutate(TARGET_SUBREDDIT = new_id) %>%
+    select(-new_id)
+  df
+})
+
+# function to standardize the shape and entries in the sentiment 
+# dataframes
+standardize_df <- function(df, all_ids) {
+    all_ids_df <- data.frame(id = all_ids)
+    df <- df %>%
+      mutate(id = SOURCE_SUBREDDIT) %>%
+      select(-SOURCE_SUBREDDIT)
+    full_df <- merge(all_ids_df, df, by = "id", all.x = TRUE)
+    if("avg_sentiment" %in% names(df)) {
+      full_df$avg_sentiment[is.na(full_df$avg_sentiment)] <- 0
+    }
+    return(full_df)
+}
+
+# apply the standardization function to the sentiment data
+yearly_sentiments_split <- lapply(yearly_sentiments_split, standardize_df, all_unique_ids)
+
+# create an empty matrix to hold reformatted sentiment data
+sentiment_matrix <- matrix(NA, nrow = length(all_unique_ids), ncol = length(yearly_sentiments_split),
+                           dimnames = list(as.character(all_unique_ids), paste0("Year_", seq_along(yearly_sentiments_split))))
+
+# insert the avg_sentiment scores into the columns of the matrix
+for (i in seq_along(yearly_sentiments_split)) {
+  ordered_df <- yearly_sentiments_split[[i]][order(yearly_sentiments_split[[i]]$id), ]
+  sentiment_matrix[, i] <- ordered_df$avg_sentiment
+}
+
+# drop the last column because it would theoretically be used to predict data
+# for a timestamp we don't have data for
+sentiment_matrix <- sentiment_matrix[, -ncol(sentiment_matrix), drop = FALSE]
+
+# we binarize the link counts in order to fit the SAOM model
+# if a there are more positive sentiment links between source_subreddit
+# and target_subreddit at timestamp1 compared to timestamp2 then we
+# say that there is a link between source_subreddit and target_subreddit
+# at timestamp2
+dfs <- list()
+for (x in 2: 4) {
+  df_time1 <- yearly_links_list[[x-1]]
+  df_time2 <- yearly_links_list[[x]]
+  df_merged <- merge(df_time1, df_time2, by = c("SOURCE_SUBREDDIT", "TARGET_SUBREDDIT"), suffixes = c(".t1", ".t2"))
+  df_merged$tie_present <- ifelse(df_merged$link_count.t2 > df_merged$link_count.t1, 1, 0)
+  df_time2_final <- df_merged[, c("SOURCE_SUBREDDIT", "TARGET_SUBREDDIT", "tie_present")]
+  dfs[[x]] <- df_time2_final
+}
+
+# convert the dataframes to networks and then to adjacency matrices in
+# order to fit the SAOM model, the network is directed and the weight
+# is 1 or 0 dependending on whether there is a tie as previously defined
+adjacency_matrices <- list()
+for (df in dfs) {
+  if (is.null(df)) next
+  net <- network(df[, c("SOURCE_SUBREDDIT", "TARGET_SUBREDDIT")], directed = TRUE)
+  set.edge.attribute(net, "weight", df$tie_present)
+  adj_matrix <- as.matrix.network(net, attrname = "weight", matrix.type = "adjacency")
+  adjacency_matrices[[length(adjacency_matrices) + 1]] <- adj_matrix
+}
+
+# stack the adjacency matrices into a 3D array
+network_array <- array(unlist(adjacency_matrices), dim = c(nrow(adjacency_matrices[[1]]),
+                                                           ncol(adjacency_matrices[[1]]),
+                                                           length(adjacency_matrices)))
+
+# create a sienaNet object for the tie data
+tie_increase <- sienaNet(network_array)
+
+# create a covariate for the sentiment scores
+sentiment <- varCovar(sentiment_matrix)
+attributes(sentiment)
+
+# create a siena data object
+siena_data <- sienaDataCreate(tie_increase, sentiment)
+
+# create a siena effects object with relevant effects for the context
+myeff <- getEffects(siena_data)
+myeff$include[]
+#effectsDocumentation(myeff)
+print(class(myeff))
+myeff <- includeEffects(myeff, gwespFF, parm = 69)
+myeff <- includeEffects(myeff, egoX, altX, sameX, interaction1 = "sentiment")
+
+# create the siena model and run it
+model <- sienaModelCreate(useStdInits = FALSE, projname = 'f_proj')
+ans <- siena07(model, data = siena_data, effects = myeff, batch = FALSE)
+summary(ans)
+
+```
+
+
+```{r}
+
+######################################################################################
+# Community Detection and Recommendation
+######################################################################################
+
+# convert to undirected graph
+undirected_reddit_network <- as.undirected(reddit_network, mode = "collapse", edge.attr.comb = list(weight= "sum"))
+
+# divide network into communities
+communities <- cluster_louvain(undirected_reddit_network)
+
+# print size of communities
+print(sizes(communities))
+
+# add community ids to network
+V(reddit_network)$community <- communities$membership
+
+# function to recommend subreddits
+recommend_subreddits <- function(input_subreddits, graph, communities, num_recommendations = 5) {
+  
+  tryCatch({
+    
+    # format as character vectors
+    input_subreddits <- as.character(input_subreddits)
+    #print(input_subreddits)
+
+    # get ids and names for given subreddits
+    input_vertex_ids <- which(V(graph)$name %in% input_subreddits)
+    input_vertex_names <- V(graph)$name[V(graph)$name %in% input_subreddits]
+
+    # get communities for the given subreddits
+    input_communities <- communities$membership[input_vertex_ids]
+    #print(length(input_communities))
+
+    # get ids and names for the communities
+    community_vertex_ids <- which(communities$membership %in% input_communities)
+    community_vertex_names <- V(graph)$name[communities$membership %in% input_communities]
+
+    # get edges in the network determined to be positive links
+    edge_ids <- which(E(graph)$LINK_SENTIMENT > 0)  # Filter edges with positive sentiment
+    
+    # get the subreddits associated with the positive edges
+    edge_from_to <- ends(graph, edge_ids)  
+
+    # filter the edges to get edges from the inputted subreddits to
+    # the subreddits within their shared communities
+    positive_edges <- edge_ids[
+        edge_from_to[, 1] %in% input_vertex_names &
+        edge_from_to[, 2] %in% community_vertex_names
+    ]
+
+    # check if there are positive edges
+    if (length(positive_edges) > 0) {
+      
+      edge_df <- get.data.frame(graph, what = "edges")[positive_edges, ]
+      
+      # Aggregate to get the sum of Compound Sentiment and count of links for each subreddit
+      aggregation_results <- aggregate(
+        cbind(
+          CompoundSentiment = edge_df$CompoundSentiment,
+          LinkCount = edge_df$CompoundSentiment) ~ to, 
+          data = edge_df, 
+          FUN = function(x) c(Sum = sum(x), Count = length(x)
+        )
+      )
+
+      # Convert the results into a more readable format
+      aggregation_results <- do.call(data.frame, aggregation_results)
+      names(aggregation_results)[2:3] <- c("SumCompoundSentiment", "LinkCount")
+      
+      # sort by sum of compound sentiment and select top recommendations
+      top_subreddits <- head(aggregation_results[order(-aggregation_results$SumCompoundSentiment), "to"], num_recommendations)
+      
+    } else {
+        top_subreddits <- character(0)
+    }
+    
+    return(top_subreddits)
+    
+  }, error = function(e) {
+    
+    print("an error occured")
+    print(e$message)
+    return(character(0))
+    
+  })
+}
+
+# function to visualize communities containing specified subreddits
+plot_communities_with_subreddits <- function(graph, subreddits, communities) {
+  
+  # find community ids for the input subreddits
+  subreddit_ids <- which(V(graph)$name %in% subreddits)
+  community_ids <- unique(communities$membership[subreddit_ids])
+  
+  # get vertices that are in the same communities
+  community_vertex_ids <- which(communities$membership %in% community_ids)
+  
+  # create a subgraph with these vertices
+  community_subgraph <- induced_subgraph(graph, community_vertex_ids)
+  
+  # plot the subgraph
+  plot(community_subgraph, vertex.size=5, vertex.label.cex=0.7,
+       vertex.color=ifelse(V(community_subgraph)$name %in% subreddits, "red", "lightblue"),
+       main="Subreddits and their Communities")
+  
+  # highlight the input subreddits
+  highlight_vertex_ids <- which(V(community_subgraph)$name %in% subreddits)
+  plot(community_subgraph, vertex.size=5, vertex.label.cex=0.7,
+       vertex.color=ifelse(seq_len(vcount(community_subgraph)) %in% highlight_vertex_ids, "red", "lightblue"),
+       main="Highlighted User Subreddits in Communities")
+}
+
+
+# example user inputted subreddits
+select_random_subreddits <- function(graph, num_random = 5) {
+  random_subreddits <- sample(V(graph)$name, num_random)
+  return(random_subreddits)
+}
+
+user_subreddits <- select_random_subreddits(reddit_network, 5)
+
+# calls recommend_subreddits
+recommended_subreddits <- recommend_subreddits(user_subreddits, reddit_network, communities)
+
+# print output of recommendation function
+print(user_subreddits)
+print(recommended_subreddits)
+plot_communities_with_subreddits(reddit_network, user_subreddits, communities)
+```
